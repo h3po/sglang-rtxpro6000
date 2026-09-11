@@ -596,6 +596,31 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+
+        # === BEGIN topk_ids capture (MoE kernel tuning) ===
+        # Dump real routing tensors for benchmark/kernels/fused_moe_triton
+        # tuning_fused_moe_triton_sep.py. Enable with SGLANG_TOPK_SAVE_DIR
+        # (writable, e.g. /tuning/topk_ids/<model>). Prefill-size batches only;
+        # the NEXTN draft model is skipped to avoid layer-id filename collisions.
+        if hidden_states.shape[0] >= 4096 and not getattr(self, "is_nextn", False):
+            import os
+
+            topk_ids_dir = os.getenv("SGLANG_TOPK_SAVE_DIR")
+            if topk_ids_dir:
+                from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+                if get_tensor_model_parallel_rank() == 0:
+                    os.makedirs(topk_ids_dir, exist_ok=True)
+                    if not hasattr(self, "save_idx"):
+                        self.save_idx = 0
+                    if self.save_idx <= 2:
+                        torch.save(
+                            topk_output.topk_ids,
+                            f"{topk_ids_dir}/topk_ids_layer{self.layer_id}_idx{self.save_idx}.pt",
+                        )
+                    self.save_idx += 1
+        # === END topk_ids capture ===
+
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):

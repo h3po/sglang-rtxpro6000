@@ -119,8 +119,10 @@ class KernelWrapper:
 
 
 def load_topk_ids(topk_ids_dir, i: int):
-    num_layers = 61
-    dense_layers = 3
+    # Qwen-61L/3-dense defaults; Qwen4-Exp (e.g. Qwen3.8-Flash-Next, 48 MoE
+    # layers, no dense) needs SGLANG_TOPK_NUM_LAYERS=48 SGLANG_TOPK_DENSE_LAYERS=0.
+    num_layers = int(os.environ.get("SGLANG_TOPK_NUM_LAYERS", 61))
+    dense_layers = int(os.environ.get("SGLANG_TOPK_DENSE_LAYERS", 3))
     moe_layers = num_layers - dense_layers
     return torch.load(
         f"{topk_ids_dir}/topk_ids_layer{i % moe_layers + dense_layers}_idx{i // moe_layers}.pt"
