@@ -1,5 +1,6 @@
 """Multimodal embedding scheduling and cache coordination."""
 
+import os
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -282,6 +283,23 @@ class PerImageRequestInfo:
     )
 
 
+def _vit_micro_batch_size() -> int:
+    """Max images per ViT call on the batched per-image miss path.
+
+    Read from SGLANG_MM_VIT_MICRO_BATCH; defaults to 12 when unset or
+    unparsable.  0 (or a negative value) disables chunking and keeps the
+    original single-ViT-call behavior for the whole miss batch.
+    """
+    raw = os.environ.get("SGLANG_MM_VIT_MICRO_BATCH", "").strip()
+    if not raw:
+        return 12
+    try:
+        k = int(raw)
+    except ValueError:
+        return 12
+    return k if k > 0 else 0
+
+
 def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
@@ -289,7 +307,8 @@ def _batch_encode_per_image_misses(
 ) -> Dict[int, torch.Tensor]:
     """
     Collect cache misses across ALL per-image requests, deduplicate by hash,
-    encode in a single ViT call, and populate the cache.
+    encode in ViT micro-batches of K images (see _vit_micro_batch_size; a
+    single call when K == 0 or K >= the miss count), and populate the cache.
 
     Returns:
         hash_to_embedding: mapping from item.hash to its full embedding tensor.
@@ -320,37 +339,68 @@ def _batch_encode_per_image_misses(
                 token_count = end - start + 1
                 unique_misses[item.hash] = (item, token_count)
 
-    # Phase 1b: single ViT call for all unique cache misses
+    # Phase 1b: ViT call(s) for all unique cache misses.  The encode+split+
+    # cache body runs per micro-batch of K images (SGLANG_MM_VIT_MICRO_BATCH,
+    # see _vit_micro_batch_size) so peak transient memory is one chunk's ViT
+    # activations + pos_embed instead of the whole miss batch's; each chunk is
+    # cached as it completes.  K == 0 or K >= the miss count takes exactly the
+    # original single-call path.
     if unique_misses:
         ordered_hashes = list(unique_misses.keys())
         miss_items = [unique_misses[h][0] for h in ordered_hashes]
         token_counts = [unique_misses[h][1] for h in ordered_hashes]
 
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
-            _move_items_to_device(miss_items, device)
-        all_miss_embedding = data_embedding_func(miss_items)
+        def _encode_and_cache_chunk(
+            chunk_hashes: List[int],
+            chunk_items: List[MultimodalDataItem],
+            chunk_token_counts: List[int],
+        ) -> None:
+            if not _can_skip_pre_embed_feature_move(data_embedding_func):
+                _move_items_to_device(chunk_items, device)
+            all_miss_embedding = data_embedding_func(chunk_items)
 
-        if isinstance(all_miss_embedding, list):
-            # Per-item embeddings: no split needed, and each cache entry owns
-            # its storage (a torch.split view would pin the whole concatenated
-            # buffer for as long as any single item stays cached). Mirrors
-            # _get_chunked_embedding_by_item.
-            assert len(all_miss_embedding) == len(miss_items), (
-                f"per-item embedding count {len(all_miss_embedding)} != "
-                f"cache-miss item count {len(miss_items)}"
+            if isinstance(all_miss_embedding, list):
+                # Per-item embeddings: no split needed, and each cache entry owns
+                # its storage (a torch.split view would pin the whole concatenated
+                # buffer for as long as any single item stays cached). Mirrors
+                # _get_chunked_embedding_by_item.
+                assert len(all_miss_embedding) == len(chunk_items), (
+                    f"per-item embedding count {len(all_miss_embedding)} != "
+                    f"cache-miss item count {len(chunk_items)}"
+                )
+                split_embeddings = [
+                    emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
+                ]
+            else:
+                all_miss_embedding = all_miss_embedding.reshape(
+                    -1, all_miss_embedding.shape[-1]
+                )
+                # chunk_token_counts is sliced from the same ordering as
+                # chunk_items, so the split lands on item boundaries.
+                split_embeddings = torch.split(
+                    all_miss_embedding, chunk_token_counts, dim=0
+                )
+            for h, emb in zip(chunk_hashes, split_embeddings):
+                embedding_cache.set(h, EmbeddingResult(embedding=emb))
+                # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
+                hash_to_embedding[h] = emb
+
+        micro_batch = _vit_micro_batch_size()
+        if 0 < micro_batch < len(miss_items):
+            logger.info(
+                f"mm_schedule: encoding {len(miss_items)} cache-miss images "
+                f"in ViT micro-batches of {micro_batch} "
+                f"(SGLANG_MM_VIT_MICRO_BATCH)"
             )
-            split_embeddings = [
-                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
-            ]
+            for start in range(0, len(miss_items), micro_batch):
+                end = min(start + micro_batch, len(miss_items))
+                _encode_and_cache_chunk(
+                    ordered_hashes[start:end],
+                    miss_items[start:end],
+                    token_counts[start:end],
+                )
         else:
-            all_miss_embedding = all_miss_embedding.reshape(
-                -1, all_miss_embedding.shape[-1]
-            )
-            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
-        for h, emb in zip(ordered_hashes, split_embeddings):
-            embedding_cache.set(h, EmbeddingResult(embedding=emb))
-            # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
-            hash_to_embedding[h] = emb
+            _encode_and_cache_chunk(ordered_hashes, miss_items, token_counts)
 
     return hash_to_embedding
 
@@ -529,7 +579,7 @@ def _get_chunked_prefill_embedding(
         else:
             full_path_requests.append(req_info)
 
-    # Phase 1: batch encode all per-image cache misses in ONE ViT call
+    # Phase 1: batch encode all per-image cache misses (micro-batched ViT calls)
     hash_to_embedding: Dict[int, torch.Tensor] = {}
     if per_image_requests:
         hash_to_embedding = _batch_encode_per_image_misses(
